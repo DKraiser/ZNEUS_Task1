@@ -18,6 +18,8 @@ import torch.nn as nn
 import tqdm
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
+import wandb
+import json
 
 """### EDA and data preparation"""
 
@@ -143,20 +145,21 @@ class Data:
     ds_X = torch.tensor(df.drop(columns=['match']).values, dtype=torch.float32)
     ds_y = torch.tensor(df['match'].values, dtype=torch.float32).view(-1, 1)
 
-    X_train, X_temp, y_train, y_temp = train_test_split(ds_X, ds_y, test_size=1 - cfg.training_part, random_state=cfg.seed)
-    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=cfg.seed)
+    X_train, X_temp, y_train, y_temp = train_test_split(ds_X, ds_y, test_size=1-cfg["training"], random_state=cfg["seed"])
+    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=cfg["seed"])
 
-    self.dataloader_train = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X_train, y_train), batch_size=cfg.batch_size, num_workers=cfg.max_workers, shuffle=True)
-    self.dataloader_val = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X_val, y_val), batch_size=cfg.batch_size, num_workers=cfg.max_workers, shuffle=False)
-    self.dataloader_test = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X_test, y_test), batch_size=cfg.batch_size, num_workers=cfg.max_workers, shuffle=False)
+    self.dataloader_train = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X_train, y_train), batch_size=cfg["batch_size"], num_workers=cfg["max_workers"], shuffle=True)
+    self.dataloader_val = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X_val, y_val), batch_size=cfg["batch_size"], num_workers=cfg["max_workers"], shuffle=False)
+    self.dataloader_test = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X_test, y_test), batch_size=cfg["batch_size"], num_workers=cfg["max_workers"], shuffle=False)
 
 class MLP(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.main = nn.Sequential(
-            nn.Linear(cfg.n_in, cfg.n_hidden),
+            nn.Linear(cfg["n_in"], cfg["n_hidden"]),
             nn.ReLU(),
-            nn.Linear(cfg.n_hidden, cfg.n_out),
+            nn.Dropout(cfg["dropout"]),
+            nn.Linear(cfg["n_hidden"], cfg["n_out"]),
             nn.Sigmoid()
         )
 
@@ -173,12 +176,18 @@ class Trainer:
 
   def fit(self):
     loss = nn.MSELoss()
-    opt = torch.optim.SGD(params=self.mlp.parameters(), lr=self.cfg.learning_rate)
-    for epoch in range(self.cfg.epoch_count):
-      self.train(loss, opt, epoch)
-      self.val(loss, opt, epoch)
+    opt = torch.optim.SGD(params=self.mlp.parameters(), lr=self.cfg["learning_rate"], weight_decay=cfg["weight_decay"])
+    for epoch in range(self.cfg["epochs"]):
+      log = dict()
+      self.train(loss, opt, epoch, log)
+      self.val(loss, opt, epoch, log)
 
-  def train(self, loss, opt, epoch):
+      wandb.log({
+        "train_loss": log["train_avg_loss"],
+        "val_loss": log["val_avg_loss"]
+      })
+
+  def train(self, loss, opt, epoch, log):
     total_loss = 0
     with tqdm.tqdm(self.data.dataloader_train, desc=f"Train {epoch}: ") as progress:
       for x, y in progress:
@@ -195,9 +204,10 @@ class Trainer:
         total_loss += l.item()
 
       avg_loss = total_loss / len(self.data.dataloader_train)
+      log["train_avg_loss"] = avg_loss
       print(f"Train {epoch} average loss: {avg_loss}")
 
-  def val(self, loss, opt, epoch):
+  def val(self, loss, opt, epoch, log):
     total_loss = 0
     with tqdm.tqdm(self.data.dataloader_val, desc=f"Val {epoch}: ") as progress:
       with torch.no_grad():
@@ -212,6 +222,7 @@ class Trainer:
 
         avg_loss = total_loss / len(self.data.dataloader_val)
         self.val_loss_stat.append(avg_loss)
+        log["val_avg_loss"] = avg_loss
         print(f"Val {epoch} average loss: {avg_loss}")
 
   def show_stat(self):
@@ -231,23 +242,25 @@ df = pd.read_csv(file_path, na_values=['?'])
 df = preprocess(df)
 df = clear(df)
 
-@dataclass
-class Cfg:
-  batch_size: int = 16
-  max_workers: int = 2
+cfg={
+  "batch_size": 16,
+  "max_workers": 2,
+  "training": 0.7,
+  "seed": 42,
+  "n_in": None,
+  "n_hidden": 16,
+  "n_out": 1,
+  "learning_rate": 0.1,
+  "epochs": 100,
+  "dropout": 0.3,
+  "weight_decay": 0.0001
+}
 
-  training_part: float = 0.7
-  seed: int = 42
-
-  n_in: int = None
-  n_hidden: int = 64
-  n_out: int = 1
-
-  learning_rate: float = 0.1
-  epoch_count: int = 100
-
-cfg = Cfg(n_in=len(df.columns) - 1)
-
+cfg["n_in"]=len(df.columns) - 1
 trainer = Trainer(df, cfg)
+
+wandb.init(project="speeddating", config=cfg)
 trainer.fit()
-trainer.show_stat()
+torch.save(trainer.mlp.state_dict(), "mlp.pt")
+wandb.save("mlp.pt")
+wandb.finish()

@@ -128,3 +128,26 @@ Data columns (total 20 columns):
 
 - ### 0.3 The prototype of a NN
 Now there is a prototype of the NN with a possibility of setting some parameters
+
+- ### 0.4 Experiment tracking with wandb and first experiments
+Now we can track the experiments and the results are:
+1. Initial: with the following config is visible the NN memorizes the training part but not patterns - train loss is decreasing and val loss is growing - overfitting. Lets try to reduce the count of neurons
+cfg={
+  "batch_size": 16,
+  "max_workers": 2,
+  "dropout": 0.3,
+  "seed": 42,
+  "n_in": None,
+  "n_hidden": 64,
+  "n_out": 1,
+  "learning_rate": 0.1,
+  "epochs": 100
+}
+
+2. Reduced count of neurons in the hidden layer: the config with the count of 32 instead of 64 was used and the results are following: the decrease of training loss has slowed down and the increase of val loss slowed down too, but still grows. Another way will be tried - dropout + weight decay.
+
+3. dropout = 0.2 and weight_decay = 0.0001. The overfitting has weakened.
+
+4. The increasing of dropout to 0.3 is tried. Result is that increasing of dropout was not useful, so the next experiment is reducing the count of hidden neurons again. 
+
+5. The count of hiddens of 16 was tried. The NN is almost not learning, so it is too small. In next experiments 32 hidden will be used
