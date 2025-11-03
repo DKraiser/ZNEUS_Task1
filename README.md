@@ -126,3 +126,5 @@ Data columns (total 20 columns):
 | 18 | met |                         
 | 19 | match |        
 
+- ### 0.3 The prototype of a NN
+Now there is a prototype of the NN with a possibility of setting some parameters
