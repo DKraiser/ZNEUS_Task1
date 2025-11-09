@@ -74,7 +74,7 @@ def preprocess(df):
   df['field'] = df['field'].fillna('Unknown').apply(map_field)
 
   # Default num vals
-  num_cols = df.select_dtypes(include=['int64', 'float64']).columns
+  num_cols = df.select_dtypes(include=['int64', 'float64']).drop(columns=['match']).columns
   # Ranges [a-b]
   range_cols = [col for col in df.columns if df[col].dtype == 'object' and df[col].str.contains(r'\[.*-.*\]', regex=True, na=False).any()]
   # Categorical values - all that are not in others
@@ -86,7 +86,6 @@ def preprocess(df):
   print(f'Total cols num: {len(num_cols) + len(range_cols) + len(categorical_cols)}')
 
   std_scaler = StandardScaler()
-  mm_scaler = MinMaxScaler()
   df[num_cols] = df[num_cols].fillna(df[num_cols].median())
   df[num_cols] = std_scaler.fit_transform(df[num_cols])
 
@@ -97,7 +96,7 @@ def preprocess(df):
       df[col] = df[col].apply(parse_mean)
       df[col] = df[col].fillna(df[col].median())
 
-  df[range_cols] = mm_scaler.fit_transform(df[range_cols])
+  df[range_cols] = std_scaler.fit_transform(df[range_cols])
   return df
 
 def clear(df):
@@ -145,19 +144,51 @@ class Data:
     ds_X = torch.tensor(df.drop(columns=['match']).values, dtype=torch.float32)
     ds_y = torch.tensor(df['match'].values, dtype=torch.float32).view(-1, 1)
 
-    X_train, X_temp, y_train, y_temp = train_test_split(ds_X, ds_y, test_size=1-cfg["training"], random_state=cfg["seed"])
-    X_val, X_test, y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=cfg["seed"])
+    self.X_train, X_temp, self.y_train, y_temp = train_test_split(ds_X, ds_y, test_size=1 - cfg["training"], random_state=cfg["seed"])
+    self.X_val, X_test, self.y_val, y_test = train_test_split(X_temp, y_temp, test_size=0.5, random_state=cfg["seed"])
 
-    self.dataloader_train = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X_train, y_train), batch_size=cfg["batch_size"], num_workers=cfg["max_workers"], shuffle=True)
-    self.dataloader_val = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X_val, y_val), batch_size=cfg["batch_size"], num_workers=cfg["max_workers"], shuffle=False)
-    self.dataloader_test = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(X_test, y_test), batch_size=cfg["batch_size"], num_workers=cfg["max_workers"], shuffle=False)
+    y_train_flat = self.y_train.view(-1)
+    class_counts = torch.bincount(y_train_flat.long())
+    class_weights = 1.0 / class_counts.float()
+    sample_weights = class_weights[y_train_flat.long()]
+    sampler = torch.utils.data.WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True
+    )
+
+    train_ds = torch.utils.data.TensorDataset(self.X_train, self.y_train)
+    val_ds = torch.utils.data.TensorDataset(self.X_val, self.y_val)
+    test_ds = torch.utils.data.TensorDataset(X_test, y_test)
+
+    self.dataloader_train = torch.utils.data.DataLoader(
+        train_ds,
+        batch_size=cfg["batch_size"],
+        num_workers=cfg["max_workers"],
+        sampler=sampler,
+        shuffle=False
+    )
+
+    self.dataloader_val = torch.utils.data.DataLoader(
+        val_ds,
+        batch_size=cfg["batch_size"],
+        num_workers=cfg["max_workers"],
+        shuffle=False
+    )
+
+    self.dataloader_test = torch.utils.data.DataLoader(
+        test_ds,
+        batch_size=cfg["batch_size"],
+        num_workers=cfg["max_workers"],
+        shuffle=False
+    )
 
 class MLP(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.main = nn.Sequential(
             nn.Linear(cfg["n_in"], cfg["n_hidden"]),
-            nn.ReLU(),
+            nn.LeakyReLU(),
             nn.Dropout(cfg["dropout"]),
             nn.Linear(cfg["n_hidden"], cfg["n_out"]),
             nn.Sigmoid()
@@ -167,24 +198,27 @@ class MLP(nn.Module):
         return self.main(x)
 
 class Trainer:
-  def __init__(self, df, cfg):
-    self.cfg = cfg
+  def __init__(self, df):
+    self.cfg = wandb.config
     self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    self.data = Data(df, cfg)
-    self.mlp = MLP(cfg).to(self.device)
-    self.val_loss_stat = list()
+    self.data = Data(df, self.cfg)
+    self.mlp = MLP(self.cfg).to(self.device)
 
   def fit(self):
-    loss = nn.MSELoss()
-    opt = torch.optim.SGD(params=self.mlp.parameters(), lr=self.cfg["learning_rate"], weight_decay=cfg["weight_decay"])
+    loss = nn.BCELoss()
+    opt = torch.optim.Adam(params=self.mlp.parameters(), lr=self.cfg["learning_rate"], weight_decay=cfg["weight_decay"])
     for epoch in range(self.cfg["epochs"]):
       log = dict()
       self.train(loss, opt, epoch, log)
-      self.val(loss, opt, epoch, log)
+      self.val(loss, epoch, log)
 
       wandb.log({
         "train_loss": log["train_avg_loss"],
-        "val_loss": log["val_avg_loss"]
+        "val_loss": log["val_avg_loss"],
+        "accuracy": log["accuracy"],
+        "precision": log["precision"],
+        "recall": log["recall"],
+        "f1": log["f1"]
       })
 
   def train(self, loss, opt, epoch, log):
@@ -205,10 +239,12 @@ class Trainer:
 
       avg_loss = total_loss / len(self.data.dataloader_train)
       log["train_avg_loss"] = avg_loss
-      print(f"Train {epoch} average loss: {avg_loss}")
 
-  def val(self, loss, opt, epoch, log):
+  def val(self, loss, epoch, log):
     total_loss = 0
+    all_preds = []
+    all_targets = []
+
     with tqdm.tqdm(self.data.dataloader_val, desc=f"Val {epoch}: ") as progress:
       with torch.no_grad():
         for x, y in progress:
@@ -220,27 +256,34 @@ class Trainer:
 
           total_loss += l.item()
 
-        avg_loss = total_loss / len(self.data.dataloader_val)
-        self.val_loss_stat.append(avg_loss)
-        log["val_avg_loss"] = avg_loss
-        print(f"Val {epoch} average loss: {avg_loss}")
+          all_preds.append((match_hat.cpu() > cfg["decision_threshold"]).float())
+          all_targets.append(y.cpu())
 
-  def show_stat(self):
-    x = range(len(self.val_loss_stat))
-    y = self.val_loss_stat
+    avg_loss = total_loss / len(self.data.dataloader_val)
+    all_preds = torch.cat(all_preds)
+    all_targets = torch.cat(all_targets)
 
-    fig = plt.figure()
-    ax = fig.subplots(1, 1)
+    TP = ((all_preds == 1) & (all_targets == 1)).sum().item()
+    TN = ((all_preds == 0) & (all_targets == 0)).sum().item()
+    FP = ((all_preds == 1) & (all_targets == 0)).sum().item()
+    FN = ((all_preds == 0) & (all_targets == 1)).sum().item()
 
-    ax.plot(x, y)
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Loss")
-    fig.show()
+    accuracy = (TP + TN) / (TP + TN + FP + FN + 1e-8)
+    precision = TP / (TP + FP + 1e-8)
+    recall = TP / (TP + FN + 1e-8)
+    f1 = 2 * precision * recall / (precision + recall + 1e-8)
+
+    log["val_avg_loss"] = avg_loss
+    log["accuracy"] = accuracy
+    log["precision"] = precision
+    log["recall"] = recall
+    log["f1"] = f1
 
 file_path = os.path.join('speeddating.csv')
 df = pd.read_csv(file_path, na_values=['?'])
 df = preprocess(df)
 df = clear(df)
+df['match'].value_counts(normalize=True)
 
 cfg={
   "batch_size": 16,
@@ -248,19 +291,43 @@ cfg={
   "training": 0.7,
   "seed": 42,
   "n_in": None,
-  "n_hidden": 16,
+  "n_hidden": 12,
   "n_out": 1,
-  "learning_rate": 0.1,
+  "learning_rate": 0.0001,
   "epochs": 100,
-  "dropout": 0.3,
-  "weight_decay": 0.0001
+  "dropout": 0.2,
+  "weight_decay": 0.0001,
+  "decision_threshold": 0.65
 }
 
 cfg["n_in"]=len(df.columns) - 1
-trainer = Trainer(df, cfg)
 
 wandb.init(project="speeddating", config=cfg)
+trainer = Trainer(df)
 trainer.fit()
 torch.save(trainer.mlp.state_dict(), "mlp.pt")
 wandb.save("mlp.pt")
 wandb.finish()
+
+sweep_cfg = {
+    "method": "random",
+    "metric": {"name": "val_loss", "goal": "minimize"},
+    "parameters": {
+        "n_hidden": {"values": [12, 16, 32]},
+        "decision_threshold": {"values": [0.5, 0.6, 0.7]},
+        "dropout": {"values": [0.2, 0.3]},
+        "learning_rate": {"values": [0.1, 0.01, 0.001, 0.0001]}
+    }
+}
+
+def sweep():
+  wandb.init(config=cfg)
+  trainer = Trainer(df)
+  trainer.fit()
+  torch.save(trainer.mlp.state_dict(), "mlp.pt")
+  wandb.save("mlp.pt")
+  wandb.finish()
+
+sweep_id = wandb.sweep(sweep_cfg, project="speeddating")
+wandb.agent(sweep_id, function=sweep, count=20)
+
